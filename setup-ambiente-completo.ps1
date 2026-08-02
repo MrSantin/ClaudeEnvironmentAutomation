@@ -836,6 +836,7 @@ async def gemini_execute(prompt: str, model: str = "", timeout: str = "",
         "--dangerously-skip-permissions",
         "--print-timeout", timeout or DEFAULT_TIMEOUT,
         "--model", model or DEFAULT_MODEL,
+        "--add-dir", os.getcwd(),
         "-p", prompt,
     ], report=report)
 
@@ -870,6 +871,7 @@ async def gemini_execute_verbose(prompt: str, model: str = "", timeout: str = ""
         "--dangerously-skip-permissions",
         "--print-timeout", timeout or DEFAULT_TIMEOUT,
         "--model", model or DEFAULT_MODEL,
+        "--add-dir", os.getcwd(),
         "-p", prompt,
     ], report=report)
 
