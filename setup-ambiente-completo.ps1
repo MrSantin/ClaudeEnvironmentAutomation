@@ -598,30 +598,152 @@ async def _run_agy_streaming(args, report=None):
     """
     cmd = ["agy"] + list(args)
 
-    if os.name == "nt":                       # Windows nativo -> ConPTY
-        try:
-            from winpty import PtyProcess
-        except ImportError:
-            raise GeminiUnavailable(
-                "GEMINI_UNAVAILABLE: pywinpty ausente (pip install pywinpty) ou use WSL")
+    if os.name == "nt":                       # Windows: painel WT com captura via PTY
+        import sys, tempfile, uuid, subprocess, shutil, time
 
-        proc = PtyProcess.spawn(cmd)
-        chunks = []
-
-        while True:
+        def _timeout_secs():
+            # extrai o valor de --print-timeout dos args; fallback DEFAULT_TIMEOUT.
+            # aceita "30m"/"1h"/"900s"/numero puro. Retorna segundos (int) + margem.
+            val = DEFAULT_TIMEOUT
+            a = list(args)
+            for i, x in enumerate(a):
+                if x == "--print-timeout" and i + 1 < len(a):
+                    val = a[i + 1]
+                    break
+            s = str(val).strip().lower()
             try:
-                chunk = await asyncio.to_thread(proc.read)
-                chunks.append(chunk)
+                if s.endswith("ms"):
+                    base = int(float(s[:-2]) / 1000)
+                elif s.endswith("h"):
+                    base = int(float(s[:-1]) * 3600)
+                elif s.endswith("m"):
+                    base = int(float(s[:-1]) * 60)
+                elif s.endswith("s"):
+                    base = int(float(s[:-1]))
+                else:
+                    base = int(float(s))
+            except ValueError:
+                base = 1800
+            return base + 300
 
-                cleaned = _clean(chunk)
-                if cleaned.strip() and report:
-                    last_line = cleaned.strip().split("\n")[-1][:200]
-                    await report("[agy] " + last_line)
-            except EOFError:
-                break
+        under_wt = bool(os.environ.get("WT_SESSION")) and shutil.which("wt")
 
-        raw = "".join(chunks)
-        code = proc.wait()
+        if under_wt:
+            run_id = uuid.uuid4().hex
+            tmp = tempfile.gettempdir()
+            log_file = os.path.join(tmp, "agy_%s.log" % run_id)
+            done_file = os.path.join(tmp, "agy_%s.done" % run_id)
+            wrap_py = os.path.join(tmp, "agy_%s_wrap.py" % run_id)
+
+            # garante que o log exista para o tail poder abrir
+            open(log_file, "w", encoding="utf-8").close()
+
+            # wrapper roda DENTRO do painel: spawna o agy sob PTY, espelha os bytes
+            # no console (colorido) e tambem grava no log. exit 0 sempre (o codigo
+            # real vai no .done) para o WT fechar o painel inclusive em falha.
+            wrapper_src = (
+                "import sys\n"
+                "try:\n"
+                "    sys.stdout.reconfigure(encoding='utf-8', errors='replace')\n"
+                "except Exception:\n"
+                "    pass\n"
+                "from winpty import PtyProcess\n"
+                "CMD = %r\n"
+                "LOG = %r\n"
+                "DONE = %r\n"
+                "proc = PtyProcess.spawn(CMD)\n"
+                "with open(LOG, 'a', encoding='utf-8', errors='replace') as _log:\n"
+                "    while True:\n"
+                "        try:\n"
+                "            chunk = proc.read()\n"
+                "        except EOFError:\n"
+                "            break\n"
+                "        if not chunk:\n"
+                "            continue\n"
+                "        sys.stdout.write(chunk)\n"
+                "        sys.stdout.flush()\n"
+                "        _log.write(chunk)\n"
+                "        _log.flush()\n"
+                "code = proc.wait()\n"
+                "with open(DONE, 'w', encoding='utf-8') as _d:\n"
+                "    _d.write(str(code if code is not None else 0))\n"
+                "sys.exit(0)\n"
+            ) % (cmd, log_file, done_file)
+            with open(wrap_py, "w", encoding="utf-8") as f:
+                f.write(wrapper_src)
+
+            wt_cmd = ["wt", "-w", "0", "split-pane", "--title", "agy",
+                      sys.executable, wrap_py]
+            if report:
+                await report("[agy] Abrindo painel no Windows Terminal...")
+            subprocess.Popen(wt_cmd)
+
+            deadline = time.monotonic() + _timeout_secs()
+            pos = 0
+            while not os.path.exists(done_file):
+                if time.monotonic() > deadline:
+                    for _p in (log_file, wrap_py):
+                        try:
+                            os.remove(_p)
+                        except OSError:
+                            pass
+                    raise GeminiUnavailable(
+                        "GEMINI_UNAVAILABLE: painel agy nao respondeu no tempo "
+                        "esperado (timeout). Windows Terminal disponivel?")
+                await asyncio.sleep(0.4)
+                try:
+                    with open(log_file, "r", encoding="utf-8", errors="replace") as lf:
+                        lf.seek(pos)
+                        new = lf.read()
+                        pos = lf.tell()
+                    if new and report:
+                        cleaned = _clean(new)
+                        if cleaned.strip():
+                            last = cleaned.strip().split("\n")[-1][:200]
+                            await report("[agy] " + last)
+                except OSError:
+                    pass
+
+            code_str = ""
+            try:
+                with open(done_file, "r", encoding="utf-8") as df:
+                    code_str = df.read().strip()
+            except OSError:
+                pass
+            code = int(code_str) if code_str.lstrip("-").isdigit() else 1
+
+            try:
+                with open(log_file, "r", encoding="utf-8", errors="replace") as lf:
+                    raw = lf.read()
+            except OSError:
+                raw = ""
+
+            for _p in (done_file, log_file, wrap_py):
+                try:
+                    os.remove(_p)
+                except OSError:
+                    pass
+        else:
+            # Fora do Windows Terminal: ConPTY in-process (sem painel), como antes.
+            try:
+                from winpty import PtyProcess
+            except ImportError:
+                raise GeminiUnavailable(
+                    "GEMINI_UNAVAILABLE: pywinpty ausente (pip install pywinpty) ou use WSL")
+            proc = PtyProcess.spawn(cmd)
+            chunks = []
+            while True:
+                try:
+                    chunk = await asyncio.to_thread(proc.read)
+                    chunks.append(chunk)
+                    cleaned = _clean(chunk)
+                    if cleaned.strip() and report:
+                        last_line = cleaned.strip().split("\n")[-1][:200]
+                        await report("[agy] " + last_line)
+                except EOFError:
+                    break
+            raw = "".join(chunks)
+            code = proc.wait()
     else:                                     # Unix/WSL -> pty da stdlib
         import pty
         buf = bytearray()
