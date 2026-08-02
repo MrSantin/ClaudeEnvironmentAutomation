@@ -953,15 +953,23 @@ cruzada) e a economia de tokens (o orcamento do Gemini e maior):
    delegacao (ver abaixo), o Claude assume a execucao. Sempre anuncie antes.
 
 3. **Arquivo com acentuacao** -- o `agy` tem risco documentado de corromper
-   UTF-8 -> CP1252 (mojibake de dupla codificacao). Para arquivos NOVOS
-   acentuados, o Claude escreve direto. Para EDICOES, o servidor MCP tem um
-   guardrail automatico: apos cada `gemini_execute`/`gemini_execute_verbose`
-   ele detecta o mojibake introduzido pelo `agy` e anexa ao resultado um aviso
-   `[GUARDRAIL-ENCODING]` com os arquivos e as linhas exatas corrompidas (+
-   sugestao de correcao), SEM reverter o arquivo -- o codigo bom do `agy` fica
-   preservado. Quando esse aviso aparecer, o Claude corrige cirurgicamente
-   APENAS as linhas listadas (edicao direta), sem reescrever o arquivo inteiro
-   nem redelegar ao `agy`. O guardrail e desligavel via `AGY_ENCODING_GUARD=0`.
+   UTF-8 -> CP1252 (mojibake de dupla codificacao). Isso NAO e passe-livre para
+   o Claude codar: neste projeto quase todo arquivo tem portugues (comentarios,
+   `/// <summary>`, nomes de dominio), entao tratar "tem acento" como excecao
+   faria a excecao engolir a regra cardinal e transformar o Claude em executor.
+   **A regra e sempre delegar ao `agy`, inclusive arquivos NOVOS acentuados.**
+   Ao delegar, inclua a clausula de encoding dando a saida explicita: *se tiver
+   qualquer duvida quanto a preservar UTF-8, escreva SEM acentuacao mesmo* --
+   texto sem acento e feio e recuperavel; mojibake nao. Duas redes de protecao
+   cobrem o resto: (a) a propria clausula "sem acento na duvida"; (b) para
+   EDICOES, o servidor MCP tem um guardrail automatico: apos cada
+   `gemini_execute`/`gemini_execute_verbose` ele detecta o mojibake introduzido
+   pelo `agy` e anexa ao resultado um aviso `[GUARDRAIL-ENCODING]` com os
+   arquivos e as linhas exatas corrompidas (+ sugestao de correcao), SEM
+   reverter o arquivo -- o codigo bom do `agy` fica preservado. Quando esse
+   aviso aparecer, o Claude corrige cirurgicamente APENAS as linhas listadas
+   (edicao direta), sem reescrever o arquivo inteiro nem redelegar ao `agy`. O
+   guardrail e desligavel via `AGY_ENCODING_GUARD=0`.
 
 4. **Override explicito do usuario** -- o usuario pede explicitamente para o
    Claude codar. Caso contrario, delegue.
