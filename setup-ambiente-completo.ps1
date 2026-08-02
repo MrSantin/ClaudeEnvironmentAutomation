@@ -7,14 +7,14 @@
     Script unificado que configura AMBAS as camadas da orquestração:
 
     Camada 1 — Claude Code (orquestrador):
-      - Servidor MCP Python (~/.claude/mcp/antigravity_mcp.py)
+      - Servidor MCP Python (~/.claude/mcp/antigravity_mcp.py) — execução: -Model
       - Registro MCP no escopo de usuário (claude mcp add --scope user)
       - Regra global de orquestração (~/.claude/CLAUDE.md)
       - Subagente executor opcional (~/.claude/agents/gemini-executor.md)
 
     Camada 2 — Antigravity CLI (executor):
       - Regra global de fallback entre modelos (~/.gemini/GEMINI.md)
-      - Modelo padrão em settings.json → Gemini 3.1 Pro (High)
+      - Modelo padrão do agy em settings.json → Gemini 3.1 Pro (High) (-AgyDefaultModel)
 
     O script também verifica e instala automaticamente todas as dependências:
       - Python 3.9+ (via winget)
@@ -45,8 +45,14 @@
     Também instala o subagente gemini-executor (opcional).
 
 .PARAMETER Model
-    Nome do modelo padrão. O agy espera o NOME EXIBIDO com espaços e sufixo
-    de esforço — ex.: "Gemini 3.1 Pro (High)", não um slug como "gemini-3.1-pro".
+    Modelo de EXECUÇÃO usado pelo servidor MCP quando o Claude delega código ao
+    agy (bakeado em DEFAULT_MODEL). O agy espera o NOME EXIBIDO com espaços e
+    sufixo de esforço — ex.: "Gemini 3.1 Pro (High)", não um slug.
+
+.PARAMETER AgyDefaultModel
+    Modelo padrão do agy gravado em settings.json (uso interativo do agy, fora
+    do MCP). Independente de -Model, embora por padrão coincida com ele.
+    Ex.: "Gemini 3.1 Pro (High)" ou "Claude Opus 4.6 (Thinking)".
 
 .PARAMETER SkipInstall
     Pula a instalação automática de ferramentas ausentes (só verifica).
@@ -88,7 +94,8 @@ param(
     [switch]$Restore,
     [switch]$KeepSubagent,
     [switch]$SkipInstall,
-    [string]$Model = "Gemini 3.1 Pro (High)"
+    [string]$Model = "Gemini 3.1 Pro (High)",
+    [string]$AgyDefaultModel = "Gemini 3.1 Pro (High)"
 )
 
 $ErrorActionPreference = "Stop"
@@ -946,12 +953,15 @@ cruzada) e a economia de tokens (o orcamento do Gemini e maior):
    delegacao (ver abaixo), o Claude assume a execucao. Sempre anuncie antes.
 
 3. **Arquivo com acentuacao** -- o `agy` tem risco documentado de corromper
-   UTF-8 -> CP1252. Para arquivos NOVOS acentuados, o Claude escreve direto. Para
-   edicoes, o servidor MCP tem um guardrail que DETECTA o mojibake introduzido pelo
-   `agy` e aponta as linhas exatas com o aviso `[GUARDRAIL-ENCODING]` no resultado de
-   `gemini_execute`, SEM reverter o arquivo (o codigo bom do `agy` e preservado).
-   Quando esse aviso aparecer, corrija cirurgicamente APENAS as linhas listadas
-   (edicao direta), sem reescrever o arquivo inteiro nem redelegar ao `agy`.
+   UTF-8 -> CP1252 (mojibake de dupla codificacao). Para arquivos NOVOS
+   acentuados, o Claude escreve direto. Para EDICOES, o servidor MCP tem um
+   guardrail automatico: apos cada `gemini_execute`/`gemini_execute_verbose`
+   ele detecta o mojibake introduzido pelo `agy` e anexa ao resultado um aviso
+   `[GUARDRAIL-ENCODING]` com os arquivos e as linhas exatas corrompidas (+
+   sugestao de correcao), SEM reverter o arquivo -- o codigo bom do `agy` fica
+   preservado. Quando esse aviso aparecer, o Claude corrige cirurgicamente
+   APENAS as linhas listadas (edicao direta), sem reescrever o arquivo inteiro
+   nem redelegar ao `agy`. O guardrail e desligavel via `AGY_ENCODING_GUARD=0`.
 
 4. **Override explicito do usuario** -- o usuario pede explicitamente para o
    Claude codar. Caso contrario, delegue.
@@ -965,16 +975,54 @@ e concentre-se em garantir a qualidade do resultado.
 
 Ao delegar, o `prompt` deve ser UMA instrucao completa e autocontida: o `agy` nao
 enxerga o historico da conversa nem o plano aprovado. Inclua caminhos de arquivo,
-contratos a preservar e o criterio de pronto.
+contratos a preservar e o criterio de pronto. Use o template da secao
+"Template de prompt para delegacao ao agy" abaixo.
+
+### Tratamento de falha: classificar ANTES de decidir
+Se `mcp__antigravity__gemini_execute` retornar ERRO, a tarefa NUNCA fica
+incompleta -- mas a acao depende da classe da falha. Classifique primeiro:
+
+**Classe A -- Quota / indisponibilidade** (mensagem comeca com
+`GEMINI_UNAVAILABLE`, ou fala em quota/limite/cooldown):
+1. Retente ate o mesmo limite da Classe B (6 tentativas no total). Decisao do
+   usuario: o orcamento de tokens do Gemini nesta maquina e MAIOR que o do
+   Claude, entao insistir no `agy` custa menos que cair para o Claude. Mensagem
+   de quota tambem pode ser erro interno mal rotulado.
+2. So depois da 6a falha va para o Fallback anunciado.
+
+**Classe B -- Falha transiente** (timeout, conexao recusada, servidor MCP caiu,
+erro de transporte/parse, resposta vazia -- qualquer coisa que NAO seja quota):
+1. ANTES de retentar, rode `git status` e `git diff` para ver se o `agy` ja
+   escreveu algo. Timeout NAO significa que nada foi feito -- a suite de testes
+   deste ambiente leva ~60s e derruba a delegacao com o trabalho ja no disco.
+   - Se o trabalho ja esta completo no diff: NAO retente. Siga para a Auditoria
+     obrigatoria pos-execucao.
+   - Se ha trabalho parcial: NAO reenvie o prompt original (reaplicaria edicoes
+     em cima do que ja existe). Ou reenvie um prompt reescrito que descreva o
+     estado atual e so o que falta, ou conclua voce mesmo.
+   - Se o diff esta limpo: retente a delegacao (ver limite abaixo).
+2. Limite de 6 tentativas no total (a original + ate 5 retries). Erro interno do
+   `agy` e comum quando Claude e Antigravity rodam na MESMA maquina disputando
+   recurso -- na maioria das vezes o retry resolve. So depois da 6a falha va
+   para o Fallback anunciado.
+3. **A checagem de `git status`/`git diff` do passo 1 se repete ANTES DE CADA
+   retry, nao so antes do primeiro.** Uma tentativa que falhou pode ter deixado
+   trabalho parcial no disco; reenviar o prompt original por cima disso duplica
+   edicoes. A cada rodada: diff limpo -> reenvia o prompt original; diff com
+   trabalho parcial -> reenvia um prompt reescrito com o estado atual e so o que
+   falta; diff completo -> para de tentar e vai para a Auditoria pos-execucao.
+4. O limite de 6 vale para as duas classes. Preferir gastar tentativa no `agy` a
+   gastar token do Claude e decisao consciente do usuario -- respeite-a.
 
 ### Fallback obrigatorio e anunciado
-Se a chamada de `mcp__antigravity__gemini_execute` retornar ERRO cuja mensagem
-comeca com `GEMINI_UNAVAILABLE`, NUNCA deixe a tarefa incompleta:
-1. NAO tente de novo (a quota e semanal, com cooldown de dias -- retry nao ajuda).
-2. AVISE o usuario explicitamente, antes de continuar:
-   "O Gemini (Antigravity CLI) esta indisponivel (limite semanal de quota ou erro).
+Ao cair no fallback (Classe A, ou Classe B apos o limite de tentativas):
+1. AVISE o usuario explicitamente, antes de continuar, dizendo QUAL foi a causa
+   e QUANTAS tentativas foram feitas. Ex.:
+   "O Gemini (Antigravity CLI) falhou por <causa> (<n> tentativas).
    Vou concluir esta etapa via Claude (assinatura) para nao deixar a tarefa pela metade."
-3. Assuma a execucao voce mesmo, usando o plano ja aprovado, e conclua.
+2. Assuma a execucao voce mesmo, usando o plano ja aprovado, e conclua.
+3. Nunca inicie a etapa de coding via Claude sem antes ter esgotado o caminho
+   acima -- fallback silencioso ou precoce e violacao desta regra.
 
 ### Auditoria obrigatoria pos-execucao
 Delegar NAO encerra a responsabilidade do Claude. Ao contrario: e aqui que o
@@ -1242,16 +1290,16 @@ function Install-SettingsJson {
     $currentModel = $settings.model
 
     Write-Info "Modelo atual: $currentModel"
-    Write-Info "Modelo alvo:  $Model"
+    Write-Info "Modelo alvo:  $AgyDefaultModel"
 
-    if ($currentModel -eq $Model) {
+    if ($currentModel -eq $AgyDefaultModel) {
         Write-Ok "Modelo ja esta configurado corretamente"
     } else {
         Backup-File $SettingsPath | Out-Null
-        $settings.model = $Model
+        $settings.model = $AgyDefaultModel
         $settingsJson = $settings | ConvertTo-Json -Depth 10
         Write-Utf8Bom -Path $SettingsPath -Content $settingsJson
-        Write-Ok "Modelo atualizado: '$currentModel' -> '$Model'"
+        Write-Ok "Modelo atualizado: '$currentModel' -> '$AgyDefaultModel'"
     }
 }
 
@@ -1449,7 +1497,8 @@ if (-not $Force -and -not $DryRun) {
     Write-Host "    6. Atualizar modelo padrao em settings.json" -ForegroundColor White
     Write-Host "    7. Executar smoke test" -ForegroundColor White
     Write-Host ""
-    Write-Host "  Modelo padrao: $Model" -ForegroundColor Cyan
+    Write-Host "  Modelo de execucao (MCP):        $Model" -ForegroundColor Cyan
+    Write-Host "  Modelo padrao do agy (settings): $AgyDefaultModel" -ForegroundColor Cyan
     Write-Host "  Backups serao criados automaticamente antes de qualquer alteracao." -ForegroundColor Gray
     Write-Host ""
     $confirm = Read-Host "  Continuar? (S/n)"
