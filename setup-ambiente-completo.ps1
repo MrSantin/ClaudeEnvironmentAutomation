@@ -560,7 +560,33 @@ def _clean(raw):
     return "\n".join(line.rstrip() for line in text.split("\n")).strip()
 
 
-async def _run_agy_streaming(args, ctx=None):
+def _progress_reporter(ctx):
+    """Cria um reporter de progresso com valor SEMPRE crescente.
+
+    O protocolo MCP exige que 'progress' aumente a cada notificacao; o Claude
+    Code descarta notificacoes cujo progress nao avanca. A versao anterior usava
+    progress=<contagem de \n>, que fica em 0 durante a fase de 'pensamento' do
+    agy (spinner com \r, sem \n) -- entao todas as notificacoes saiam com
+    progress=0, iguais a inicial, e o cliente exibia so a primeira. Um contador
+    monotonico resolve isso. Deduplica mensagens identicas consecutivas para nao
+    repetir frames de spinner. total=0 => progresso indeterminado.
+    """
+    state = {"n": 0, "last": None}
+
+    async def report(message):
+        if not ctx or not message or message == state["last"]:
+            return
+        state["n"] += 1
+        state["last"] = message
+        try:
+            await ctx.report_progress(progress=state["n"], total=0, message=message)
+        except Exception:
+            pass
+
+    return report
+
+
+async def _run_agy_streaming(args, report=None):
     """Roda `agy` sob PTY com streaming de progresso via MCP.
 
     Diferente da versao anterior (sincrona, buffer total), esta versao:
@@ -581,26 +607,16 @@ async def _run_agy_streaming(args, ctx=None):
 
         proc = PtyProcess.spawn(cmd)
         chunks = []
-        lines_seen = 0
 
         while True:
             try:
                 chunk = await asyncio.to_thread(proc.read)
                 chunks.append(chunk)
-                lines_seen += chunk.count("\n")
 
-                # Extrai a ultima linha significativa para reportar progresso
                 cleaned = _clean(chunk)
-                if cleaned.strip() and ctx:
+                if cleaned.strip() and report:
                     last_line = cleaned.strip().split("\n")[-1][:200]
-                    try:
-                        await ctx.report_progress(
-                            progress=lines_seen,
-                            total=0,
-                            message="[agy] " + last_line
-                        )
-                    except Exception:
-                        pass  # Nao deixa falha de progresso quebrar a execucao
+                    await report("[agy] " + last_line)
             except EOFError:
                 break
 
@@ -730,7 +746,7 @@ def _snapshot(root):
     return snap
 
 
-async def _guarded_run(args, ctx=None):
+async def _guarded_run(args, report=None):
     """Envolve _run_agy_streaming com o guardrail de encoding.
 
     Retorna (clean, raw, code, warnings), onde warnings e uma lista de
@@ -738,12 +754,12 @@ async def _guarded_run(args, ctx=None):
     mojibake. Nenhum arquivo e modificado aqui.
     """
     if os.environ.get("AGY_ENCODING_GUARD", "1") == "0":
-        clean, raw, code = await _run_agy_streaming(args, ctx=ctx)
+        clean, raw, code = await _run_agy_streaming(args, report=report)
         return clean, raw, code, []
 
     root = os.getcwd()
     before = _snapshot(root)
-    clean, raw, code = await _run_agy_streaming(args, ctx=ctx)
+    clean, raw, code = await _run_agy_streaming(args, report=report)
 
     warnings = []
     seen = set()
@@ -813,30 +829,17 @@ async def gemini_execute(prompt: str, model: str = "", timeout: str = "",
     if not prompt or not prompt.strip():
         raise GeminiUnavailable("GEMINI_UNAVAILABLE: prompt vazio")
 
-    if ctx:
-        try:
-            await ctx.report_progress(
-                progress=0, total=0,
-                message="[agy] Iniciando execucao via Antigravity CLI..."
-            )
-        except Exception:
-            pass
+    report = _progress_reporter(ctx)
+    await report("[agy] Iniciando execucao via Antigravity CLI...")
 
     clean, _raw, code, warns = await _guarded_run([
         "--dangerously-skip-permissions",
         "--print-timeout", timeout or DEFAULT_TIMEOUT,
         "--model", model or DEFAULT_MODEL,
         "-p", prompt,
-    ], ctx=ctx)
+    ], report=report)
 
-    if ctx:
-        try:
-            await ctx.report_progress(
-                progress=100, total=100,
-                message="[agy] Execucao concluida - processando resultado"
-            )
-        except Exception:
-            pass
+    await report("[agy] Execucao concluida - processando resultado")
 
     if code != 0:
         detalhe = (clean[-300:] if clean else "sem saida").replace("\n", " ")
@@ -860,21 +863,15 @@ async def gemini_execute_verbose(prompt: str, model: str = "", timeout: str = ""
     if not prompt or not prompt.strip():
         raise GeminiUnavailable("GEMINI_UNAVAILABLE: prompt vazio")
 
-    if ctx:
-        try:
-            await ctx.report_progress(
-                progress=0, total=0,
-                message="[agy] Iniciando execucao (modo verbose)..."
-            )
-        except Exception:
-            pass
+    report = _progress_reporter(ctx)
+    await report("[agy] Iniciando execucao (modo verbose)...")
 
     clean, raw, code, warns = await _guarded_run([
         "--dangerously-skip-permissions",
         "--print-timeout", timeout or DEFAULT_TIMEOUT,
         "--model", model or DEFAULT_MODEL,
         "-p", prompt,
-    ], ctx=ctx)
+    ], report=report)
 
     if code != 0:
         detalhe = (raw[-500:] if raw else "sem saida").replace("\n", " ")
@@ -890,16 +887,10 @@ async def gemini_execute_verbose(prompt: str, model: str = "", timeout: str = ""
 @mcp.tool()
 async def gemini_models(ctx: Context = None) -> str:
     """Lista os nomes de modelo disponiveis no Antigravity CLI."""
-    if ctx:
-        try:
-            await ctx.report_progress(
-                progress=0, total=0,
-                message="[agy] Consultando modelos disponiveis..."
-            )
-        except Exception:
-            pass
+    report = _progress_reporter(ctx)
+    await report("[agy] Consultando modelos disponiveis...")
 
-    clean, _raw, _ = await _run_agy_streaming(["models"], ctx=ctx)
+    clean, _raw, _ = await _run_agy_streaming(["models"], report=report)
     return clean or "sem saida"
 
 
