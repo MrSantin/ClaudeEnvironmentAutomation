@@ -493,8 +493,19 @@ function Get-ServerContent {
 
 gemini_execute(prompt, model?, timeout?) -> str
     Roda `agy -p` sob PTY (workaround do issue #76), limpa ANSI e devolve texto.
+    Reporta progresso em tempo real via notifications/progress do MCP.
     Em quota/erro/saida-vazia LEVANTA erro cuja mensagem comeca com
     'GEMINI_UNAVAILABLE:' -> vira tool error (isError) para o orquestrador.
+
+    Guardrail de encoding: apos a execucao, detecta arquivos em que o agy
+    introduziu mojibake (dupla codificacao UTF-8->CP1252). NAO reverte o
+    arquivo (preserva o codigo bom do agy); anexa ao resultado um aviso
+    [GUARDRAIL-ENCODING] com as linhas exatas para o Claude corrigir a mao.
+    Desligavel via AGY_ENCODING_GUARD=0.
+
+gemini_execute_verbose(prompt, model?, timeout?) -> str
+    Igual ao gemini_execute, mas devolve o output bruto (sem limpeza ANSI).
+    Use para diagnosticar problemas de output ou verificar o raciocinio do agy.
 
 gemini_models() -> str
     Lista os IDs de modelo disponiveis (agy models).
@@ -502,13 +513,14 @@ gemini_models() -> str
 Deps: mcp (pip install "mcp[cli]") + pywinpty no Windows nativo.
 Gerado por setup-ambiente-completo.ps1 - edicoes manuais serao sobrescritas.
 """
+import asyncio
 import os
 import re
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 
 DEFAULT_MODEL = os.environ.get("AGY_EXEC_MODEL", "__MODEL_ID__")
-DEFAULT_TIMEOUT = os.environ.get("AGY_EXEC_TIMEOUT", "5m")
+DEFAULT_TIMEOUT = os.environ.get("AGY_EXEC_TIMEOUT", "30m")
 
 ANSI = re.compile(r"\x1B(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\))")
 QUOTA = re.compile(r"quota|rate.?limit|resource.?exhausted|429|cooldown|weekly|"
@@ -541,8 +553,16 @@ def _clean(raw):
     return "\n".join(line.rstrip() for line in text.split("\n")).strip()
 
 
-def _run_agy(args):
-    """Roda `agy` sob PTY e devolve a saida limpa de TUI."""
+async def _run_agy_streaming(args, ctx=None):
+    """Roda `agy` sob PTY com streaming de progresso via MCP.
+
+    Diferente da versao anterior (sincrona, buffer total), esta versao:
+    1. Le chunks incrementalmente do PTY
+    2. Envia notifications/progress ao Claude Code a cada chunk significativo
+    3. Roda a leitura bloqueante em thread separada para nao travar o event loop
+
+    Retorna (texto_limpo, texto_bruto, exit_code).
+    """
     cmd = ["agy"] + list(args)
 
     if os.name == "nt":                       # Windows nativo -> ConPTY
@@ -551,13 +571,32 @@ def _run_agy(args):
         except ImportError:
             raise GeminiUnavailable(
                 "GEMINI_UNAVAILABLE: pywinpty ausente (pip install pywinpty) ou use WSL")
+
         proc = PtyProcess.spawn(cmd)
         chunks = []
+        lines_seen = 0
+
         while True:
             try:
-                chunks.append(proc.read())
+                chunk = await asyncio.to_thread(proc.read)
+                chunks.append(chunk)
+                lines_seen += chunk.count("\n")
+
+                # Extrai a ultima linha significativa para reportar progresso
+                cleaned = _clean(chunk)
+                if cleaned.strip() and ctx:
+                    last_line = cleaned.strip().split("\n")[-1][:200]
+                    try:
+                        await ctx.report_progress(
+                            progress=lines_seen,
+                            total=0,
+                            message="[agy] " + last_line
+                        )
+                    except Exception:
+                        pass  # Nao deixa falha de progresso quebrar a execucao
             except EOFError:
                 break
+
         raw = "".join(chunks)
         code = proc.wait()
     else:                                     # Unix/WSL -> pty da stdlib
@@ -572,26 +611,225 @@ def _run_agy(args):
         raw = buf.decode("utf-8", "replace")
         code = os.waitstatus_to_exitcode(status)
 
-    return _clean(raw), code
+    return _clean(raw), raw, code
+
+
+# ---------------------------------------------------------------------------
+# Guardrail de encoding: detecta mojibake introduzido pelo agy
+# ---------------------------------------------------------------------------
+# O agy tem bug documentado: le um arquivo UTF-8, decodifica os bytes como
+# CP1252 e regrava, produzindo dupla codificacao (mojibake). O resultado ainda
+# e UTF-8 VALIDO -- entao um decode("utf-8") estrito NAO pega. A deteccao real
+# compara a assinatura de mojibake antes vs. depois da execucao do agy.
+#
+# Politica: NAO reverter o arquivo. O agy costuma escrever muito codigo bom e
+# so as linhas acentuadas corrompem; reverter sacrificaria o trabalho todo. Em
+# vez disso, preservamos o arquivo e reportamos as linhas exatas para o Claude
+# corrigir cirurgicamente (edicao direta).
+
+# Lead U+00C2/U+00C3/U+00E2 (bytes 0x82..0xE2 de sequencias UTF-8 lidas como
+# CP1252) seguido de outro char Latin-1; mais o par "a-EUR" e o U+FFFD.
+_MOJIBAKE = re.compile(
+    "[\u00c2\u00c3\u00e2][\u0080-\u00ff]"
+    "|\u00e2\u20ac"
+    "|\ufffd"
+)
+
+_SKIP_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build",
+    ".mypy_cache", ".pytest_cache", ".idea", ".vs", "bin", "obj",
+}
+
+
+def _mojibake_count(text):
+    return len(_MOJIBAKE.findall(text))
+
+
+def _file_corrupted(before, after):
+    """True sse o agy introduziu mojibake: assinatura aumentou, ou o arquivo
+    era UTF-8 valido e deixou de ser. Auto-calibrado -> zero falso positivo."""
+    try:
+        after.decode("utf-8")
+        after_valid = True
+    except UnicodeDecodeError:
+        after_valid = False
+    try:
+        before.decode("utf-8")
+        before_valid = True
+    except UnicodeDecodeError:
+        before_valid = False
+    if before_valid and not after_valid:
+        return True
+    b = _mojibake_count(before.decode("utf-8", "replace"))
+    a = _mojibake_count(after.decode("utf-8", "replace"))
+    return a > b
+
+
+def _corrupt_lines(after):
+    """Lista (numero_da_linha, texto) das linhas com mojibake no arquivo."""
+    text = after.decode("utf-8", "replace")
+    out = []
+    for i, line in enumerate(text.split("\n"), 1):
+        if _MOJIBAKE.search(line):
+            out.append((i, line))
+    return out
+
+
+def _repair_hint(line):
+    """Sugestao revertendo a dupla codificacao. So uma DICA -- quem aplica e
+    o Claude. Retorna None se a reversao nao produzir texto limpo."""
+    try:
+        fixed = line.encode("cp1252").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return None
+    if fixed != line and not _MOJIBAKE.search(fixed):
+        return fixed
+    return None
+
+
+def _iter_candidates(root):
+    maxb = int(os.environ.get("AGY_GUARD_MAXBYTES", "5000000"))
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for fn in filenames:
+            p = os.path.join(dirpath, fn)
+            try:
+                if os.path.getsize(p) > maxb:
+                    continue
+            except OSError:
+                continue
+            out.append(p)
+    return out
+
+
+def _read_text_bytes(path):
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if b"\x00" in data[:4096]:      # provavelmente binario -> ignora
+        return None
+    return data
+
+
+def _snapshot(root):
+    snap = {}
+    for p in _iter_candidates(root):
+        data = _read_text_bytes(p)
+        if data is not None:
+            snap[p] = data
+    return snap
+
+
+async def _guarded_run(args, ctx=None):
+    """Envolve _run_agy_streaming com o guardrail de encoding.
+
+    Retorna (clean, raw, code, warnings), onde warnings e uma lista de
+    (path, [(lineno, texto), ...]) para cada arquivo em que o agy introduziu
+    mojibake. Nenhum arquivo e modificado aqui.
+    """
+    if os.environ.get("AGY_ENCODING_GUARD", "1") == "0":
+        clean, raw, code = await _run_agy_streaming(args, ctx=ctx)
+        return clean, raw, code, []
+
+    root = os.getcwd()
+    before = _snapshot(root)
+    clean, raw, code = await _run_agy_streaming(args, ctx=ctx)
+
+    warnings = []
+    seen = set()
+    # Arquivos preexistentes que o agy alterou
+    for p, old in before.items():
+        seen.add(p)
+        new = _read_text_bytes(p)
+        if new is None or new == old:
+            continue
+        if _file_corrupted(old, new):
+            warnings.append((p, _corrupt_lines(new)))
+    # Arquivos novos que o agy criou ja com mojibake
+    for p in _iter_candidates(root):
+        if p in seen:
+            continue
+        new = _read_text_bytes(p)
+        if new is None:
+            continue
+        if _file_corrupted(b"", new):
+            warnings.append((p, _corrupt_lines(new)))
+    return clean, raw, code, warnings
+
+
+def _format_warnings(warnings, root):
+    if not warnings:
+        return ""
+    out = [
+        "",
+        "[GUARDRAIL-ENCODING] agy introduziu mojibake (UTF-8->CP1252) em "
+        "%d arquivo(s)." % len(warnings),
+        "O conteudo do agy foi PRESERVADO; corrija APENAS as linhas abaixo via",
+        "edicao direta (Claude), sem reescrever o resto do arquivo:",
+    ]
+    for p, corrupt in warnings:
+        try:
+            rel = os.path.relpath(p, root)
+        except ValueError:
+            rel = p
+        out.append("  " + rel + ":")
+        for lineno, text in corrupt[:50]:
+            snippet = text.strip()[:120]
+            hint = _repair_hint(text)
+            if hint:
+                out.append("    L%d: %s   -> sugestao: %s"
+                           % (lineno, snippet, hint.strip()[:120]))
+            else:
+                out.append("    L%d: %s" % (lineno, snippet))
+        if len(corrupt) > 50:
+            out.append("    ... (+%d linhas com mojibake)" % (len(corrupt) - 50))
+    out.append("ACAO: aplique Edit cirurgico so nessas linhas; nao delegue de")
+    out.append("novo ao agy nem reverta o arquivo inteiro.")
+    return "\n".join(out)
 
 
 @mcp.tool()
-def gemini_execute(prompt: str, model: str = "", timeout: str = "") -> str:
+async def gemini_execute(prompt: str, model: str = "", timeout: str = "",
+                         ctx: Context = None) -> str:
     """Executa uma instrucao de codigo ja planejada via Antigravity CLI (Gemini).
 
     Use para aplicar edicoes multi-arquivo e refatoracoes extensas DEPOIS que o
     plano estiver aprovado. O prompt deve ser UMA instrucao completa e
     autocontida - o agy nao ve o historico da conversa.
+
+    Reporta progresso em tempo real: o Claude Code mostrara o raciocinio do agy
+    enquanto ele trabalha, sem precisar esperar o resultado final.
     """
     if not prompt or not prompt.strip():
         raise GeminiUnavailable("GEMINI_UNAVAILABLE: prompt vazio")
 
-    clean, code = _run_agy([
+    if ctx:
+        try:
+            await ctx.report_progress(
+                progress=0, total=0,
+                message="[agy] Iniciando execucao via Antigravity CLI..."
+            )
+        except Exception:
+            pass
+
+    clean, _raw, code, warns = await _guarded_run([
         "--dangerously-skip-permissions",
         "--print-timeout", timeout or DEFAULT_TIMEOUT,
         "--model", model or DEFAULT_MODEL,
         "-p", prompt,
-    ])
+    ], ctx=ctx)
+
+    if ctx:
+        try:
+            await ctx.report_progress(
+                progress=100, total=100,
+                message="[agy] Execucao concluida - processando resultado"
+            )
+        except Exception:
+            pass
 
     if code != 0:
         detalhe = (clean[-300:] if clean else "sem saida").replace("\n", " ")
@@ -600,13 +838,61 @@ def gemini_execute(prompt: str, model: str = "", timeout: str = "") -> str:
     if not clean or QUOTA.search(clean):
         tail = clean[-200:] if clean else "sem saida (possivel quota/non-TTY)"
         raise GeminiUnavailable("GEMINI_UNAVAILABLE: " + tail.replace("\n", " "))
-    return clean
+    guard = _format_warnings(warns, os.getcwd())
+    return clean + ("\n" + guard if guard else "")
 
 
 @mcp.tool()
-def gemini_models() -> str:
+async def gemini_execute_verbose(prompt: str, model: str = "", timeout: str = "",
+                                  ctx: Context = None) -> str:
+    """Igual ao gemini_execute, mas devolve o output bruto sem limpeza ANSI.
+
+    Use para diagnosticar problemas de output ou verificar a linha de raciocinio
+    completa do agy, incluindo sequencias de terminal e frames de spinner.
+    """
+    if not prompt or not prompt.strip():
+        raise GeminiUnavailable("GEMINI_UNAVAILABLE: prompt vazio")
+
+    if ctx:
+        try:
+            await ctx.report_progress(
+                progress=0, total=0,
+                message="[agy] Iniciando execucao (modo verbose)..."
+            )
+        except Exception:
+            pass
+
+    clean, raw, code, warns = await _guarded_run([
+        "--dangerously-skip-permissions",
+        "--print-timeout", timeout or DEFAULT_TIMEOUT,
+        "--model", model or DEFAULT_MODEL,
+        "-p", prompt,
+    ], ctx=ctx)
+
+    if code != 0:
+        detalhe = (raw[-500:] if raw else "sem saida").replace("\n", " ")
+        raise GeminiUnavailable(
+            "GEMINI_UNAVAILABLE: agy saiu com codigo %d: %s" % (code, detalhe))
+    if not clean or QUOTA.search(clean):
+        tail = raw[-300:] if raw else "sem saida (possivel quota/non-TTY)"
+        raise GeminiUnavailable("GEMINI_UNAVAILABLE: " + tail.replace("\n", " "))
+    guard = _format_warnings(warns, os.getcwd())
+    return raw + ("\n" + guard if guard else "")
+
+
+@mcp.tool()
+async def gemini_models(ctx: Context = None) -> str:
     """Lista os nomes de modelo disponiveis no Antigravity CLI."""
-    clean, _ = _run_agy(["models"])
+    if ctx:
+        try:
+            await ctx.report_progress(
+                progress=0, total=0,
+                message="[agy] Consultando modelos disponiveis..."
+            )
+        except Exception:
+            pass
+
+    clean, _raw, _ = await _run_agy_streaming(["models"], ctx=ctx)
     return clean or "sem saida"
 
 
@@ -624,10 +910,58 @@ function Get-OrquestraBlock {
     $body = @'
 ## Orquestracao Claude + Gemini (regra global)
 
-Divisao de trabalho padrao nesta maquina:
-- **Planejamento / arquitetura / decisoes**: eu (Claude), preferencialmente em Plan Mode.
-- **Execucao** (edicao de codigo, refatoracoes grandes, mudancas multi-arquivo):
-  delegar a ferramenta MCP `mcp__antigravity__gemini_execute`.
+### Papel do Claude nesta maquina: Planejador, Orquestrador e Auditor
+
+O Claude opera com uma hierarquia estrita de responsabilidades. Respeite
+esta ordem -- ela existe para maximizar a qualidade do codigo (auditoria
+cruzada) e a economia de tokens (o orcamento do Gemini e maior):
+
+| Prioridade | Papel | O que faz | Quando coda |
+|:----------:|-------|-----------|-------------|
+| 1 | **Planejador** | Analisa requisitos, arquiteta solucoes, toma decisoes de design | Nunca |
+| 2 | **Orquestrador** | Decompoe tarefas, monta prompts autocontidos, delega ao `agy` | Nunca |
+| 3 | **Auditor** | Revisa `git diff`, valida contratos, corrige desvios pontuais | Correcoes cirurgicas pos-auditoria |
+| 4 | **Executor (fallback)** | Assume a codificacao quando o `agy` esta indisponivel | So apos esgotar tentativas de delegacao |
+
+### Regra cardinal: DELEGUE a escrita de codigo
+
+**TODA tarefa de escrita de codigo deve ser delegada ao `agy` via
+`mcp__antigravity__gemini_execute`.** Isso inclui:
+
+- Criacao de arquivos novos
+- Edicao de arquivos existentes
+- Refatoracoes (pequenas ou grandes)
+- Implementacao de testes
+- Mudancas multi-arquivo
+- Qualquer alteracao que produza `git diff`
+
+**O Claude NAO deve escrever codigo diretamente** exceto nestas situacoes:
+
+1. **Correcao cirurgica pos-auditoria** -- ao revisar o diff do `agy`, o Claude
+   encontra um desvio pontual (ex.: assinatura de interface quebrada, import
+   faltando, typo em nome de variavel). Corrigir 1-3 linhas e mais eficiente
+   que reenviar ao `agy`. Anuncie a correcao ao usuario.
+
+2. **Fallback por indisponibilidade** -- apos esgotar as 6 tentativas de
+   delegacao (ver abaixo), o Claude assume a execucao. Sempre anuncie antes.
+
+3. **Arquivo com acentuacao** -- o `agy` tem risco documentado de corromper
+   UTF-8 -> CP1252. Para arquivos NOVOS acentuados, o Claude escreve direto. Para
+   edicoes, o servidor MCP tem um guardrail que DETECTA o mojibake introduzido pelo
+   `agy` e aponta as linhas exatas com o aviso `[GUARDRAIL-ENCODING]` no resultado de
+   `gemini_execute`, SEM reverter o arquivo (o codigo bom do `agy` e preservado).
+   Quando esse aviso aparecer, corrija cirurgicamente APENAS as linhas listadas
+   (edicao direta), sem reescrever o arquivo inteiro nem redelegar ao `agy`.
+
+4. **Override explicito do usuario** -- o usuario pede explicitamente para o
+   Claude codar. Caso contrario, delegue.
+
+**Se voce se pegar prestes a criar ou editar um arquivo de codigo sem ter
+chamado `gemini_execute` primeiro, PARE e delegue.** Seu valor como
+planejador e auditor e maior do que como executor -- deixe o `agy` executar
+e concentre-se em garantir a qualidade do resultado.
+
+### Prompt de delegacao
 
 Ao delegar, o `prompt` deve ser UMA instrucao completa e autocontida: o `agy` nao
 enxerga o historico da conversa nem o plano aprovado. Inclua caminhos de arquivo,
@@ -642,12 +976,22 @@ comeca com `GEMINI_UNAVAILABLE`, NUNCA deixe a tarefa incompleta:
    Vou concluir esta etapa via Claude (assinatura) para nao deixar a tarefa pela metade."
 3. Assuma a execucao voce mesmo, usando o plano ja aprovado, e conclua.
 
-### Revisao obrigatoria pos-execucao
-Delegar NAO encerra a responsabilidade do Claude. Apos um `gemini_execute` bem
-sucedido, revise o `git diff` real (nao o resumo textual devolvido pela tool):
-contratos quebrados (assinaturas, interfaces, nulabilidade), aderencia
-arquitetural ao padrao do projeto, e correcao funcional. Corrija desvios antes de
-reportar a tarefa como concluida.
+### Auditoria obrigatoria pos-execucao
+Delegar NAO encerra a responsabilidade do Claude. Ao contrario: e aqui que o
+papel de **Auditor** se torna critico. Apos um `gemini_execute` bem sucedido:
+
+1. **Revise o `git diff` real** (nao o resumo textual devolvido pela tool).
+2. **Verifique:** contratos quebrados (assinaturas, interfaces, nulabilidade),
+   aderencia arquitetural ao padrao do projeto, e correcao funcional.
+3. **Corrija desvios pontuais** diretamente (1-3 linhas, correcao cirurgica).
+4. **Se o desvio for estrutural**, reenvie ao `agy` com um prompt corretivo
+   em vez de reescrever voce mesmo.
+5. **Reporte ao usuario** o que foi auditado, o que passou, e o que foi corrigido.
+
+A auditoria e o que transforma a delegacao em verificacao cruzada: o `agy`
+executa sem vicio de confirmacao do planejador, e o Claude valida sem o
+vicio de execucao do implementador. Dois modelos, duas perspectivas, um
+resultado mais confiavel.
 
 Esta regra e global. Um projeto so a ignora se o CLAUDE.md do proprio projeto
 disser explicitamente o contrario.
@@ -950,11 +1294,11 @@ print('IMPORT_OK')
     }
     Write-Info "Testando o PTY com 'agy models' (nao consome quota de geracao)..."
     $ptyCheck = @"
-import importlib.util
+import importlib.util, asyncio
 spec = importlib.util.spec_from_file_location('antigravity_mcp', r'$ServerFile')
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
-out, _ = m._run_agy(['models'])
+out, _raw, _ = asyncio.run(m._run_agy_streaming(['models']))
 print('PTY_EMPTY' if not out else 'PTY_OK: ' + out[:160].replace('\n', ' '))
 "@
     $out2 = & $py.Source -c $ptyCheck
