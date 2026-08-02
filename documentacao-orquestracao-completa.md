@@ -336,6 +336,28 @@ O `agy` renderiza TUI com spinner animado. A limpeza:
 > **Ordem importa:** normalizar `\r\n` → `\n` ANTES do split por `\r`. Sem isso,
 > o `\r` final de cada linha CRLF apaga o próprio conteúdo.
 
+### Progresso em Tempo Real (Streaming)
+
+Enquanto o `agy` trabalha, o servidor MCP envia `notifications/progress` ao
+Claude Code a cada chunk significativo de saída, para que o raciocínio do `agy`
+apareça em tempo real em vez de uma "caixa preta" até o resultado final.
+
+> **O valor de `progress` DEVE ser estritamente crescente.** O protocolo MCP
+> descarta notificações cujo `progress` não avança. A implementação usa um
+> contador monotônico único por requisição (`_progress_reporter`), compartilhado
+> entre a mensagem inicial, o stream do loop e a final, com deduplicação de
+> mensagens idênticas consecutivas e `total=0` (progresso indeterminado).
+
+> **Bug histórico (corrigido):** a versão anterior usava `progress=<contagem de
+> \n>`, que ficava travado em `0` durante a fase de "pensamento" do `agy` (o
+> spinner reescreve a mesma linha com `\r`, sem `\n`). Como todas as notificações
+> saíam com `progress=0`, o Claude Code exibia apenas a primeira
+> ("Iniciando execucao...") e descartava o resto — dando a falsa impressão de
+> travamento por vários minutos.
+
+> **Atenção:** o servidor MCP é carregado no start do Claude Code. Após atualizar
+> `antigravity_mcp.py`, **reinicie o Claude Code** para a mudança valer.
+
 ---
 
 ## 6. Orquestração de Modelos e Fallback
@@ -480,6 +502,7 @@ Repita o teste: o Claude deve **avisar** e concluir sozinho. **Reverta depois.**
 | Modelo inválido | Slug em vez de nome | Use `agy models` e a string **exata** com espaços |
 | Saída cheia de `⠋ Fetching...` | Limpeza de saída antiga | Reinstale com o script atual |
 | Claude parou de usar assinatura | Vars persistidas | Confira `ANTHROPIC_*` no escopo usuário/máquina |
+| Progresso congela em "Iniciando execucao" | `progress` nao-monotonico (versao antiga do MCP) | Reinstale com o script atual e reinicie o Claude Code |
 
 ### Problemas do Antigravity / Modelos
 
